@@ -1,4 +1,4 @@
-"""Kimi-K3 with --monokernel-backend amd on MI35x, TP8, across the switch point.
+"""Kimi-K3 with --enable-amd-monokernel on MI35x, TP8, across the switch point.
 
 The runtime serves one width here: a DSpark verify step of 8 rows at one
 request in flight. The server runs one request a step, so every decode step is
@@ -37,8 +37,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_amd_mono import BACKEND
-
 LAUNCH_TIMEOUT = 3600
 # Both paths score 0.975 to 0.990 on this recipe, over three samples each, so
 # the bound is for gross failures and not for a regression of a question or
@@ -67,7 +65,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash with --monokernel-backend amd on MI35x, TP4 (RFC #43949), across the
+"""GLM-5.3-Flash with --enable-amd-monokernel on MI35x, TP4 (RFC #43949), across the
 switch points: decode steps of 1 to 16 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 16 rows and back
 (a short GSM8K run, for gross failures); with MTP, verify steps of 1 to 4 requests
@@ -30,8 +30,6 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_amd_mono import BACKEND
-
 LAUNCH_TIMEOUT = 3600
 # The normal path scores about 0.97 on GSM8K (thinking on); the bound is for gross
 # failures
@@ -50,7 +48,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )

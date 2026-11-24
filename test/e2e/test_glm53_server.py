@@ -1,4 +1,4 @@
-"""GLM-5.3 with --monokernel-backend amd on MI35x, TP8 (RFC #43949), across the
+"""GLM-5.3 with --enable-amd-monokernel on MI35x, TP8 (RFC #43949), across the
 switch points: decode steps of 1 to 8 rows run the kernels, wider ones the normal
 path, and requests join and leave a running batch that steps past 8 rows and back
 (a short GSM8K run, for gross failures); the tokens of covered steps scored again by
@@ -33,7 +33,6 @@ from sglang.test.test_utils import (
 )
 from transformers import AutoConfig
 
-from sgl_amd_mono import BACKEND
 from sgl_amd_mono.glm53.gfx950 import layout
 
 LAUNCH_TIMEOUT = 3600
@@ -58,7 +57,7 @@ def _launch(extra_env=None, extra_args=(), log=None):
         MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=LAUNCH_TIMEOUT,
-        other_args=ARGS + ["--monokernel-backend", BACKEND, *extra_args],
+        other_args=ARGS + ["--enable-amd-monokernel", *extra_args],
         env=env,
         return_stdout_stderr=log,
     )
