@@ -70,6 +70,8 @@ jobs:
 
       - name: Resolve the PR
         id: pr
+        # pipefail: a failed file list must stop the run, not scope it to `common`
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
