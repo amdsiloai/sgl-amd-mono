@@ -192,6 +192,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Judge
+        # bash (not the default bash -e) runs with pipefail: a failed check fails
+        # the model's job instead of passing through tee's exit status
+        shell: bash
         run: |
           python3 harness/scripts/ci/report.py --results "$RESULTS" --model "${{ matrix.model }}" \
             --title-type "${{ needs.plan.outputs.title_type }}" | tee -a "$GITHUB_STEP_SUMMARY"
