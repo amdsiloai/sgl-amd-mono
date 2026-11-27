@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Weekday rebuild of stable and experimental fork branches.
+"""Weekday rebuild of the fork's algorithmic branches.
+
+Pushes stripy/dev (every open team PR that applies cleanly, in order) and
+stripy/<model>/dev (approved team PRs for one model). Also builds
+stripy/testing (approved team PRs) and stripy/unstable (every open team PR)
+without pushing them: those two are merged by the conflict resolver, which
+reads their conflict lists from branch-build.json.
 
 Reads logins from FORK_TEAM_LOGINS (one per line). Never prints them.
-Does not resolve conflicts and does not build unstable branches.
 
 Per-repo settings come from FORK_SYNC_CONFIG (default
 scripts/fork_sync_config.json). Without that file the sglang defaults apply.
@@ -13,19 +18,21 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 CONFIG_PATH = os.environ.get("FORK_SYNC_CONFIG", "scripts/fork_sync_config.json")
 CONFIG = json.loads(Path(CONFIG_PATH).read_text()) if Path(CONFIG_PATH).is_file() else {}
 
 UPSTREAM_REPO = os.environ.get("UPSTREAM_REPO") or CONFIG.get("upstream_repo", "sgl-project/sglang")
-FORK_REPO = os.environ.get("FORK_REPO") or CONFIG.get("fork_repo", "rkarhila-amd/sglang")
+FORK_REPO = os.environ.get("FORK_REPO") or CONFIG.get("fork_repo", "amdsiloai/sglang")
 UPSTREAM_BRANCH = CONFIG.get("upstream_branch", "main")
 FORK_REMOTE = os.environ.get("FORK_REMOTE", "origin")
 FORK_MAIN = "refs/remotes/forksync/main"
-TOOLING = (".github/workflows/fork-sync.yml", "scripts/fork_sync.py", CONFIG_PATH)
+TOOLING = (".github/workflows/fork-sync.yml", "scripts/fork_sync.py", "scripts/fork_conflicts.py", CONFIG_PATH)
 PREFIX = "stripy/"
-TAG_RE = re.compile(r"^stripy/(?:experimental/|unstable/)?([a-z0-9.]+)-(\d{8})$")
+TAG_RE = re.compile(r"^stripy/(?:[a-z0-9.]+/)*[a-z0-9.]+-(\d{8})$")
 DRY_RUN = os.environ.get("FORK_SYNC_DRY_RUN") == "1"
 
 # Longer / more specific patterns first.
@@ -49,7 +56,7 @@ BODY_FALLBACK = CONFIG.get("body_fallback", True)
 INCLUDE_DRAFTS = CONFIG.get("include_drafts", True)
 # Files where a conflict is settled by keeping both sides' lines (git merge-file --union).
 UNION_PATHS = set(CONFIG.get("union_paths", []))
-PR_FIELDS = "number,title,body,files,latestReviews,isDraft,baseRefName,headRefName,isCrossRepository"
+PR_FIELDS = "number,title,body,files,latestReviews,isDraft,baseRefName,headRefName,isCrossRepository,author"
 
 
 def git(*args, check=True, input=None):
@@ -76,7 +83,7 @@ def hits(text, table):
     return found
 
 
-def classify(pr):
+def classify_by_content(pr):
     paths = [f["path"] for f in pr.get("files") or []]
     by_path = []
     for path in paths:
@@ -95,6 +102,12 @@ def classify(pr):
     return {"kind": "model", "models": models}
 
 
+def classify(pr):
+    c = classify_by_content(pr)
+    extra = [m for m in ISSUE_MODELS.get(pr.get("number"), []) if m not in c["models"]]
+    return {"kind": "model", "models": c["models"] + extra} if extra else c
+
+
 def approved(pr):
     return any(r.get("state") == "APPROVED" for r in pr.get("latestReviews") or [])
 
@@ -106,16 +119,138 @@ def gh_pr_list(*args):
     return json.loads(r.stdout)
 
 
-def load_open_prs():
-    """Open team PRs, plus the drafts that were left out (kept to complete stacks)."""
+def team_logins():
     raw = os.environ.get("FORK_TEAM_LOGINS", "")
-    logins = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+    return [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+
+
+NOREPLY_RE = re.compile(r"(?:\d+\+)?([A-Za-z0-9-]+)@users\.noreply\.github\.com", re.I)
+COAUTHOR_RE = re.compile(r"(?im)^co-authored-by:.*$")
+ISSUE_TITLE_RE = re.compile(r"\bPRs?\s+to\s+use\s+for\s+([A-Za-z0-9.]+)", re.I)
+# Models that open issues on the fork ask a PR to join, by PR number.
+ISSUE_MODELS = {}
+
+
+def commit_logins(commit):
+    """Logins of a commit's authors (GitHub resolves its co-authors) and noreply Co-authored-by trailers."""
+    out = {(a.get("login") or "").lower() for a in commit.get("authors") or []}
+    for line in COAUTHOR_RE.findall(commit.get("messageBody") or ""):
+        m = NOREPLY_RE.search(line)
+        if m:
+            out.add(m.group(1).lower())
+    out.discard("")
+    return out
+
+
+def involved_numbers(logins):
+    """Open upstream PRs a team member commented on, was mentioned in, was assigned or reviewed."""
+    found = set()
+    for login in logins:
+        for qualifier in ("involves", "reviewed-by"):
+            query = f"repo:{UPSTREAM_REPO} is:pr is:open {qualifier}:{login}"
+            for attempt in range(4):
+                r = subprocess.run(
+                    ["gh", "api", "-X", "GET", "search/issues", "-f", f"q={query}", "-f", "per_page=100",
+                     "--paginate", "--jq", ".items[].number"],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    break
+                time.sleep(20)
+            else:
+                print(f"warning: search for {qualifier} failed: " + r.stderr.strip()[-200:], flush=True)
+                continue
+            found.update(int(x) for x in r.stdout.split())
+            time.sleep(2.5)
+    return found
+
+
+COAUTHOR_CACHE = Path(os.environ.get("FORK_COAUTHOR_CACHE") or Path(tempfile.gettempdir()) / "fork-sync-coauthors.json")
+COAUTHOR_CACHE_TTL_S = 3 * 3600
+
+
+def coauthored_prs(logins, skip):
+    """Open upstream PRs where a team member is commit author or co-author, found among the PRs they took part in.
+
+    The scan is cached in the temp directory for the run, so the conflict step reuses the sync step's result.
+    The cache sits outside the checkout because the build runs git clean there."""
+    team = {x.lower() for x in logins}
+    key = {"upstream": UPSTREAM_REPO, "team": sorted(team), "skip": sorted(skip)}
+    try:
+        cached = json.loads(COAUTHOR_CACHE.read_text())
+        if cached.get("key") == key and time.time() - cached.get("time", 0) < COAUTHOR_CACHE_TTL_S:
+            print(f"co-author scan: reusing {len(cached['prs'])} cached PRs", flush=True)
+            return {int(n): pr for n, pr in cached["prs"].items()}
+    except (OSError, ValueError, KeyError):
+        pass
+    out = {}
+    for num in sorted(involved_numbers(logins) - set(skip)):
+        r = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS + ",commits"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            continue
+        pr = json.loads(r.stdout)
+        if any(commit_logins(c) & team for c in pr.pop("commits", None) or []):
+            out[num] = pr
+    COAUTHOR_CACHE.write_text(json.dumps({"key": key, "time": time.time(), "prs": {str(n): pr for n, pr in out.items()}}))
+    return out
+
+
+def issue_pr_numbers(body):
+    """PR numbers, one per line: 123, #123, '- #123' or a pull request URL. Text after the number is ignored."""
+    rx = re.compile(
+        r"^\s*(?:[-*]\s*)?(?:\[[ xX]\]\s*)?(?:https://github\.com/" + re.escape(UPSTREAM_REPO) + r"/pull/|#)?(\d+)\b"
+    )
+    return [int(m.group(1)) for m in map(rx.match, (body or "").splitlines()) if m]
+
+
+def load_issue_prs(prs):
+    """Open fork issues titled 'PRs to use for <model>' list PRs to put on that model's branches."""
+    ISSUE_MODELS.clear()
+    r = subprocess.run(["gh", "issue", "list", "-R", FORK_REPO, "--state", "open", "--limit", "100",
+                        "--json", "number,title,body"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("warning: listing fork issues failed: " + r.stderr.strip()[-200:], flush=True)
+        return
+    names = {name.lower(): name for name, _ in MODELS}
+    for issue in json.loads(r.stdout):
+        m = ISSUE_TITLE_RE.search(issue["title"])
+        if not m:
+            continue
+        model = names.get(m.group(1).lower())
+        if not model:
+            print(f"warning: issue #{issue['number']} names an unknown model: {m.group(1)}", flush=True)
+            continue
+        for num in issue_pr_numbers(issue["body"]):
+            if num not in prs:
+                v = subprocess.run(["gh", "pr", "view", str(num), "-R", UPSTREAM_REPO, "--json", PR_FIELDS + ",state"],
+                                   capture_output=True, text=True)
+                if v.returncode != 0:
+                    print(f"warning: issue #{issue['number']}: PR {num} not found", flush=True)
+                    continue
+                pr = json.loads(v.stdout)
+                if pr.get("state") != "OPEN":
+                    print(f"warning: issue #{issue['number']}: PR {num} is not open", flush=True)
+                    continue
+                prs[num] = pr
+            if model not in ISSUE_MODELS.setdefault(num, []):
+                ISSUE_MODELS[num].append(model)
+            print(f"selected #{num} through issue #{issue['number']} for {model}", flush=True)
+
+
+def load_open_prs():
+    """The open PR subset, plus the drafts that were left out (kept to complete stacks)."""
+    logins = team_logins()
     if not logins:
         sys.exit("FORK_TEAM_LOGINS is empty")
     prs = {}
     for login in logins:
         for pr in gh_pr_list("-R", UPSTREAM_REPO, "--state", "open", "--author", login, "--limit", "200"):
             prs[pr["number"]] = pr
+    for num, pr in coauthored_prs(logins, set(prs)).items():
+        prs[num] = pr
+        print(f"selected #{num} through a team co-author", flush=True)
+    load_issue_prs(prs)
     r = subprocess.run(
         ["gh", "pr", "list", "-R", FORK_REPO, "--state", "open", "--label", "fork-only",
          "--limit", "100", "--json", PR_FIELDS],
@@ -135,7 +270,7 @@ def load_open_prs():
 def resolve_stacks(prs, known):
     """Map each stacked upstream PR to the open PR whose head branch it is based on.
 
-    The base PR is pulled in even when it is not a team PR or is a draft, so
+    The base PR is pulled in even when it is not in the PR subset or is a draft, so
     the whole stack applies in order. A base branch without an open PR stays
     part of the stacked PR's own diff.
     """
@@ -424,7 +559,7 @@ def prune_tags(today):
         m = TAG_RE.fullmatch(tag)
         if not m:
             continue
-        day = dt.datetime.strptime(m.group(2), "%Y%m%d").date()
+        day = dt.datetime.strptime(m.group(1), "%Y%m%d").date()
         age = (today - day).days
         if day.weekday() == 0:
             limit = 26 * 7
@@ -489,7 +624,7 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
     lines = [
         f"# Branch build {today.isoformat()}",
         "",
-        f"Upstream `{UPSTREAM_REPO}` main `{upstream[:12]}`. Open pull requests only. Conflicts were recorded and not resolved. No unstable branch was built.",
+        f"Upstream `{UPSTREAM_REPO}` main `{upstream[:12]}`. Open pull requests only. Conflicts were recorded and not resolved. stripy/testing and stripy/unstable are built for the agentic merge and not pushed.",
         "",
         "## Contained",
         "",
@@ -544,8 +679,8 @@ def write_report(results, contained, multi, unpushed, removed, upstream, today, 
         Path(summary).write_text(Path("branch-build.md").read_text())
 
 
-def write_plan_json(built_all, prs, fork_only, upstream, fork_main, today, deps):
-    """Machine-readable twin of branch-build.md, read by the conflict resolver. No logins."""
+def write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps):
+    """Machine-readable twin of branch-build.md, read by the conflict resolver."""
     nums = sorted({n for b in built_all for n in b["prs"]})
     heads = {}
     for n in nums:
@@ -572,7 +707,7 @@ def write_plan_json(built_all, prs, fork_only, upstream, fork_main, today, deps)
             for b in built_all
         ],
         "prs": {
-            str(n): {"title": prs[n].get("title") or "", "head": heads.get(str(n)), "fork_only": n in fork_only,
+            str(n): {"title": titles.get(n, ""), "head": heads.get(str(n)), "fork_only": n in fork_only,
                      **({"base_pr": deps[n]} if n in deps else {})}
             for n in nums
         },
@@ -620,38 +755,30 @@ def main():
     # One copy of each model PR, in PR number order. A PR that matches several models is still listed once.
     model_nums = sorted({n for nums in groups.values() for n in nums})
     approved_models = reviewed(model_nums)
-    # dev is every approved PR that applies. experimental/dev is that stack, then the open PRs that are not approved.
+    # dev_prs is every approved PR that applies; all_open adds the open PRs that are not approved.
     dev_prs = approved_generic + approved_models
-    experimental_dev = dev_prs + [n for n in generic if n not in dev_prs] + [n for n in model_nums if n not in dev_prs]
-    plan = [(f"{PREFIX}dev", with_deps(dev_prs, deps), None),
-            (f"{PREFIX}experimental/dev", with_deps(experimental_dev, deps), f"{PREFIX}dev")]
+    all_open = dev_prs + [n for n in generic if n not in dev_prs] + [n for n in model_nums if n not in dev_prs]
+    # (branch, PR list, pushed?). testing and unstable are inputs to the conflict resolver, so they are built only.
+    plan = [(f"{PREFIX}dev", with_deps(all_open, deps), True),
+            (f"{PREFIX}testing", with_deps(dev_prs, deps), False),
+            (f"{PREFIX}unstable", with_deps(all_open, deps), False)]
     for model, nums in sorted(groups.items()):
         approved_model = reviewed(nums)
-        name = f"{PREFIX}{model}"
         if approved_model:
-            plan.append((name, with_deps(approved_generic + approved_model, deps), None))
-        plan.append((f"{PREFIX}experimental/{model}", with_deps(generic + nums, deps), name))
+            plan.append((f"{PREFIX}{model}/dev", with_deps(approved_generic + approved_model, deps), True))
     results = []
-    trees = {}
-    twins_dropped = []
     built_all = []
-    for name, nums, base in plan:
+    for name, nums, pushed in plan:
         print(f"building {name} ({len(nums)} prs)", flush=True)
         result = build(name, nums, upstream, deps)
         result["prs"] = list(nums)
+        result["pushed"] = pushed
         built_all.append(result)
         landed = sum(1 for x in result["landed"] if x["status"] == "landed")
         conflicts = len(result["skipped"])
         print(f"built {name} {result['sha'][:12]} landed={landed} conflicts={conflicts}", flush=True)
-        tree = git("rev-parse", f"{result['sha']}^{{tree}}").stdout.strip()
-        if base and trees.get(base) == tree:
-            twins_dropped.append(name)
-            continue
-        trees[name] = tree
-        results.append(result)
-    for name in twins_dropped:
-        if not DRY_RUN:
-            subprocess.run(["git", "push", FORK_REMOTE, f":refs/heads/{name}"], capture_output=True, text=True)
+        if pushed:
+            results.append(result)
     contained = sorted({x["pr"] for b in results for x in b["landed"] if x["status"] == "contained"})
     stamp = today.strftime("%Y%m%d")
     unpushed = {}
@@ -666,7 +793,8 @@ def main():
     titles = {n: (pr.get("title") or "") for n, pr in known.items()}
     ctx = {"deps": deps, "drafts": sorted(n for n in drafts if n not in stack_bases), "held": sorted(held)}
     write_report(results, contained, multi, unpushed, removed, upstream, today, titles, ctx)
-    write_plan_json(built_all, known, fork_only, upstream, fork_main, today, deps)
+    write_plan_json(built_all, titles, fork_only, upstream, fork_main, today, deps)
+    git("checkout", "--force", "--detach", fork_main)
 
 
 if __name__ == "__main__":

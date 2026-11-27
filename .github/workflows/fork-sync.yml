@@ -1,9 +1,13 @@
+# Template for the fork's .github/workflows/fork-sync.yml on repositories other than sglang
+# (sgl-aiter, sgl-amd-mono). The per-repo settings live in scripts/fork_sync_config.json, copied
+# from config/<repo>.fork_sync_config.json.
 name: Fork sync
 
 on:
   schedule:
-    # 01:00 UTC, Monday through Friday. No Saturday or Sunday run.
-    - cron: "0 1 * * 1-5"
+    # 23:17 UTC, Sunday through Thursday: the evening before each weekday. Off the top of
+    # the hour, where GitHub's scheduler is most loaded.
+    - cron: "17 23 * * 0-4"
   workflow_dispatch:
 
 permissions:
@@ -23,12 +27,21 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Rebuild stable and experimental branches
+      - name: Rebuild dev, testing and per-model dev branches
         env:
           FORK_TEAM_LOGINS: ${{ secrets.FORK_TEAM_LOGINS }}
           GH_TOKEN: ${{ github.token }}
           FORK_SYNC_CONFIG: scripts/fork_sync_config.json
         run: python3 scripts/fork_sync.py
+
+      - name: Report PR conflicts
+        if: success()
+        continue-on-error: true
+        env:
+          FORK_TEAM_LOGINS: ${{ secrets.FORK_TEAM_LOGINS }}
+          GH_TOKEN: ${{ github.token }}
+          FORK_SYNC_CONFIG: scripts/fork_sync_config.json
+        run: python3 scripts/fork_conflicts.py --set unstable --out fork-conflicts
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -37,4 +50,6 @@ jobs:
           path: |
             branch-build.md
             branch-build.json
+            fork-conflicts.md
+            fork-conflicts.json
           retention-days: 30
