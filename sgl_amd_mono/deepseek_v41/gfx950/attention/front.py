@@ -23,7 +23,7 @@ from sgl_amd_mono.common.ops import (
 )
 from sgl_amd_mono.common.plan import first_task
 from sgl_amd_mono.common.stamps import stamp
-from sgl_amd_mono.common.sync import preg
+from sgl_amd_mono.common.sync import FLAG_STRIDE, preg
 from sgl_amd_mono.deepseek_v41.gfx950.stages.gemv import (
     ld_f32,
     lds_row,
@@ -277,7 +277,7 @@ def stage_qkv(c, t):
     if const_expr(not tok_par):
         # QRDY once QX8 landed: the qr and KV record stores after it are read only past
         # this launch, and the publish's vmcnt(0) would wait on them too
-        publish(c, c["qrdy"], t)
+        publish(c, c["qrdy"], t * FLAG_STRIDE)
     if const_expr(c.get("index", False)):  # noqa: SIM102
         # the bf16 qr, SGLang's indexer's input (an index source's K1)
         if mine & (tt * 8 < Q_RANK):
@@ -475,14 +475,24 @@ def stage_wqb(c, task0, bops, t0, n, rope):
 # ---------------------------------------------------------------- kernel
 
 
+def red_floats(s: int, d: Dims) -> int:
+    """``red``: a wq_b task's accumulators each, or the wqkv chains' partials and a dead
+    wave's if more (TP8 has one wq_b task a CTA); split or not (``wqkv_split``)."""
+    waves = wqkv_order(s)[0]
+    chain_floats = max(
+        (waves + -(-chains // WAVES) * WAVES - chains) * 64 * 4
+        for chains in (waves, waves // 2)
+    )
+    return max(d.wqb_tasks // BLOCKS * RED, chain_floats)
+
+
 def front_lds(s: int, d: Dims):
     """K1's LDS (the attention front's stages)."""
     rows = tile_rows(s)
-    wqb_per_cta = d.wqb_tasks // BLOCKS
 
     @fx.struct
     class FrontLds:
-        red: fx.Array[fx.Float32, wqb_per_cta * RED + 16, 16]
+        red: fx.Array[fx.Float32, red_floats(s, d) + 16, 16]
         qxl: fx.Array[fx.Int32, rows * lds_row(QX_WORDS), 16]
         qxsl: fx.Array[fx.Int32, rows * lds_row(Q_RANK // 32), 16]
         xl: fx.Array[fx.Int32, rows * lds_row(X_WORDS), 16]
@@ -553,7 +563,7 @@ def run_front(
     chains = waves // 2 if split else waves
     dead = -(-chains // WAVES) * WAVES - chains
     # the chains' partials, and a dead wave's, fit ``red``
-    assert (waves + dead) * 64 * 4 <= wqb_per_cta * RED
+    assert (waves + dead) * 64 * 4 <= red_floats(s, Dims(key.tp))
 
     # loads complete in issue order: each CTA issues its latency-critical loads first
     wqb_task = first_task(bid, WQB0)
@@ -738,7 +748,7 @@ def run_front(
             stage_wqb(c, wqb_task, bops, t0, n, ropes[ti])
             index_tile(ti, t0, n)
     else:
-        await_flags(c, c["qrdy"], s, lambda u: u)
+        await_flags(c, c["qrdy"], s, lambda u: u * FLAG_STRIDE)
         stamp(c, 38)
         qx = (c["qx8"], c["qx8s"], QX_WORDS, 0, QX_WORDS, Q_RANK // 32, 0, Q_RANK // 32)
         regs = rows_loads(c, *qx, *tiles[0])
